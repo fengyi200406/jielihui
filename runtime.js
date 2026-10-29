@@ -430,6 +430,7 @@ var path = myUid + '/' + String(roundId) + '/' + String(slotId || 'unassigned') 
     },
     signup:async function(eventId, slotNo, name){
       var userId = await ensureUser();
+      if(!userId) throw new Error('手机端匿名登录未完成，请刷新页面后重试');
       var event = await API.getEvent(eventId);
       if(!event) throw new Error('这一期不存在');
       if(event.status !== 'open') throw new Error('这一期' + statusOf(event).label + '，暂不接受报名');
@@ -437,16 +438,31 @@ var path = myUid + '/' + String(roundId) + '/' + String(slotId || 'unassigned') 
       var existing = await supabase.from('slots').select('id,position').eq('round_id', eventId).eq('claimed_by', userId).limit(1);
       failIf(existing.error);
       if(existing.data && existing.data.length) throw new Error('你已经认领过这一期了');
-      var slot = await getSlotByPosition(eventId, slotNo);
-      if(!slot) throw new Error('棒位不存在');
-      if(slot.status === 'taken' || slot.claimed_by || slot.claimant_name) throw new Error('第 ' + slotNo + ' 棒已经被认领了');
-      var now = new Date().toISOString();
-      var claimed = await supabase.from('slots').update({ status:'taken', claimed_by:userId, claimant_name:name, claimed_at:now })
-        .eq('id', slot.id).eq('status', 'empty').select('*').maybeSingle();
-      failIf(claimed.error);
-      if(!claimed.data) throw new Error('这个棒位刚被别人认领了，请刷新后再试');
-      return { id:claimed.data.id, no:Number(claimed.data.position), name:claimed.data.claimant_name || name,
-        at:formatClaimedAt(claimed.data.claimed_at), claimed_by:claimed.data.claimed_by };
+
+      // 重新从 Supabase 读取目标棒位；不要只依赖页面初次渲染时的 EVENTS 缓存。
+      var slot = await getSlotByPosition(eventId, Number(slotNo));
+      if(!slot) throw new Error('棒位不存在，请刷新页面后重试');
+      var slotIsEmpty = slot.status === 'empty' && !slot.claimed_by && !(slot.claimant_name || '').trim();
+      if(!slotIsEmpty) throw new Error('第 ' + slotNo + ' 棒当前不是空位，请刷新后查看最新状态');
+
+      // 使用数据库 RPC 原子认领。这样不依赖手机端 UPDATE ... SELECT 的 RLS 返回行行为，
+      // 也能由数据库保证同一用户同一期只认领一次、同一棒位不会被重复认领。
+      var claimResult = await supabase.rpc('claim_slot', {
+        p_round_id: eventId,
+        p_position: Number(slotNo),
+        p_name: String(name || '').trim()
+      });
+      failIf(claimResult.error);
+      var claimedRow = Array.isArray(claimResult.data) ? claimResult.data[0] : claimResult.data;
+      if(!claimedRow){
+        var verify = await getSlotByPosition(eventId, Number(slotNo));
+        if(verify && (verify.claimed_by || verify.claimant_name || verify.status === 'taken')){
+          throw new Error('这个棒位刚被别人认领了，请刷新后再试');
+        }
+        throw new Error('报名没有写入数据库：该棒位仍为空。请在 Supabase 执行随附的 claim_slot 修复 SQL 后再试。');
+      }
+      return { id:claimedRow.id, no:Number(claimedRow.position), name:claimedRow.claimant_name || String(name || '').trim(),
+        at:formatClaimedAt(claimedRow.claimed_at), claimed_by:claimedRow.claimed_by };
     },
     cancelSignup:async function(eventId, slotNo){
       await ensureUser();
