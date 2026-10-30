@@ -289,6 +289,8 @@ var path = myUid + '/' + String(roundId) + '/' + String(slotId || 'unassigned') 
         is_best:!!work.is_best,
         featured_kind:work.featured_kind || null
       };
+    }).sort(function(a,b){
+      return Number(a.slot)-Number(b.slot) || String(a.id).localeCompare(String(b.id));
     });
     var best = mappedWorks.filter(function(w){ return w.is_best; })[0];
     var change = mappedWorks.filter(function(w){ return w.featured_kind === 'change' || w.featured_kind === 'most_changed'; })[0];
@@ -816,18 +818,22 @@ function footBar(){
 function heroBlock(){
   var ev = activeEvent();
   var mine = ev ? getReg()[ev.id] : null;
-  var pool = allWorks();
-  var pick = ['jieli-b3.jpg','jieli-a2.jpg','jieli-a3.jpg'].map(function(n){
-    return pool.filter(function(o){ return o.w.img === n; })[0];
-  }).filter(Boolean);
-  if(pick.length < 3) pick = pool.slice(0, 3);
+  var pool = allWorks().filter(function(o){ return o.w && o.w.img; });
+  // 每次重新渲染首页都重新洗牌，避免主页长期固定展示同几张作品。
+  for(var pi=pool.length-1;pi>0;pi--){
+    var pj=Math.floor(Math.random()*(pi+1));
+    var tmp=pool[pi]; pool[pi]=pool[pj]; pool[pj]=tmp;
+  }
+  COLLAGE.pool = pool;
+  COLLAGE.cursor = Math.min(3, pool.length);
+  var pick = pool.slice(0,3);
 
   var collage = '';
   if(pick.length){
     var cells = ['c1','c2','c3'];
     collage = '<div class="collage" aria-hidden="' + (pick.length ? 'false' : 'true') + '">';
     pick.forEach(function(o, i){
-      collage += '<figure class="' + cells[i] + '">'
+      collage += '<figure class="' + cells[i] + '" data-collage-index="' + i + '">'
         + '<span class="tape"></span>'
         + '<img src="' + esc(o.w.img || autoImg()) + '" alt="' + esc(o.ev.no + ' 期作品：' + o.w.title) + '" loading="lazy">'
         + '<figcaption>第 ' + o.w.slot + ' 棒 · ' + esc(o.w.author) + ' · R' + pad2(o.ev.no) + '</figcaption>'
@@ -991,6 +997,7 @@ function slotsBlock(){
 }
 
 var FEAT = { timer:null, pool:[], i:0, paused:false };
+var COLLAGE = { timer:null, pool:[], cursor:0, paused:false };
 
 /* 每期收官后都会定一张最佳、一张变化最大，这里把所有期都收进池子随机翻 */
 function featPool(){
@@ -1037,6 +1044,33 @@ function featureBlock(){
     + '</div></div>'
     + '<div class="feat-stack" id="featStack" data-round="' + pad2(host.no) + '">' + featCards(host) + '</div>'
     + '</div></section>';
+}
+
+function stopCollageCycle(){
+  if(COLLAGE.timer){ clearInterval(COLLAGE.timer); COLLAGE.timer=null; }
+}
+function startCollageCycle(){
+  stopCollageCycle();
+  var box=document.querySelector('.collage');
+  if(!box || COLLAGE.pool.length<2) return;
+  box.addEventListener('mouseenter',function(){ COLLAGE.paused=true; });
+  box.addEventListener('mouseleave',function(){ COLLAGE.paused=false; });
+  COLLAGE.timer=setInterval(function(){
+    var current=document.querySelector('.collage');
+    if(!current){ stopCollageCycle(); return; }
+    if(COLLAGE.paused || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+    var figures=current.querySelectorAll('figure');
+    if(!figures.length) return;
+    // 每轮给三张卡片分配不同作品，避免同一轮出现重复图。
+    var available=COLLAGE.pool.slice();
+    for(var i=available.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=available[i]; available[i]=available[j]; available[j]=t; }
+    Array.prototype.forEach.call(figures,function(fig,index){
+      var item=available[index]; if(!item) return;
+      var img=fig.querySelector('img'), cap=fig.querySelector('figcaption');
+      if(img){ img.style.opacity='0'; setTimeout(function(){ img.src=item.w.img || autoImg(); img.alt=item.ev.no+' 期作品：'+item.w.title; img.style.opacity='1'; },180); }
+      if(cap) cap.textContent='第 '+item.w.slot+' 棒 · '+item.w.author+' · R'+pad2(item.ev.no);
+    });
+  },5000);
 }
 
 function stopFeatCycle(){
@@ -1152,6 +1186,8 @@ function galleryView(){
 }
 
 function render(){
+  stopCollageCycle();
+  stopFeatCycle();
   var root = $('#app');
   if(!root) return;
   var html;
@@ -1167,6 +1203,8 @@ function afterRender(){
   var nodes = document.querySelectorAll('main > section, .round, .gal-side');
   if(!('IntersectionObserver' in window)){
     Array.prototype.forEach.call(nodes, function(n){ n.classList.add('is-in'); });
+    startFeatCycle();
+    startCollageCycle();
     return;
   }
   if(afterRender.io) afterRender.io.disconnect();
@@ -1181,6 +1219,7 @@ function afterRender(){
     else { n.classList.add('is-in'); }
   });
   startFeatCycle();
+  startCollageCycle();
 }
 window.__relay.refresh = refresh;
 window.__relay.render = render;
@@ -1309,7 +1348,7 @@ function tabWorks(){
   var opts = list.map(function(e){
     return '<option value="' + e.id + '"' + (e.id === ev.id ? ' selected' : '') + '>第 ' + pad2(e.no) + ' 期 · ' + esc((e.keywords || [])[0] || '未命名') + '</option>';
   }).join('');
-  var cards = (ev.works || []).map(function(w){
+  var cards = (ev.works || []).slice().sort(function(a,b){ return Number(a.slot)-Number(b.slot) || String(a.id).localeCompare(String(b.id)); }).map(function(w){
     return '<div class="wcard"><figure><img src="' + esc(w.img) + '" alt="' + esc(w.title) + '" loading="lazy"></figure>'
       + '<div class="wt">' + esc(w.title) + '</div><div class="ws">第 ' + w.slot + ' 棒 · ' + esc(w.author) + '</div>'
       + '<div class="wa"><button class="' + (ev.bestId === w.id ? 'on' : '') + '" data-act="set-best" data-ev="' + ev.id + '" data-w="' + w.id + '">最佳</button>'
