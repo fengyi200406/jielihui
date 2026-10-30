@@ -208,24 +208,41 @@
     return 'bin';
   }
   async function uploadImage(value, roundId, slotId){
-    if(typeof value !== 'string' || !value) throw new Error('没有可上传的图片');
-    if(!/^data:/i.test(value)){
-      if(/^https?:/i.test(value)) return { image_path:value, url:value, uploaded:false };
-      throw new Error('图片必须是 Base64 数据或有效图片 URL');
-    }
-    var converted = dataUrlToBlob(value);
-var userSession = await supabase.auth.getSession();
+    try{
+      if(!value) throw new Error('没有可上传的图片');
+      var converted;
+      if(typeof Blob !== 'undefined' && value instanceof Blob){
+        converted = { blob:value, mime:value.type || 'image/jpeg' };
+      }else if(typeof value === 'string' && /^data:/i.test(value)){
+        converted = dataUrlToBlob(value);
+      }else if(typeof value === 'string' && /^https?:/i.test(value)){
+        return { image_path:value, url:value, uploaded:false };
+      }else{
+        throw new Error('图片数据格式不支持');
+      }
+      if(!converted.blob || !converted.blob.size) throw new Error('图片转换结果为空');
+      if(converted.blob.size > 8 * 1024 * 1024) throw new Error('压缩后的图片仍超过 8MB，请换一张图片');
+      var ext = imageExtension(converted.mime);
+      if(ext === 'bin') throw new Error('不支持的图片格式：' + converted.mime);
+     var userSession = await supabase.auth.getSession();
 var myUid = userSession.data.session ? userSession.data.session.user.id : 'anon';
 var path = myUid + '/' + String(roundId) + '/' + String(slotId || 'unassigned') + '/' + uid('img-') + '.' + imageExtension(converted.mime);
-    var uploadResult = await supabase.storage.from('works').upload(path, converted.blob, {
-      contentType:converted.mime,
-      cacheControl:'3600',
-      upsert:false
-    });
-    if(uploadResult.error) throw uploadResult.error;
-    var publicResult = supabase.storage.from('works').getPublicUrl(path);
-    return { image_path:uploadResult.data && uploadResult.data.path ? uploadResult.data.path : path,
-      url:publicResult && publicResult.data ? publicResult.data.publicUrl : '', uploaded:true };
+      var uploadResult = await supabase.storage.from('works').upload(path, converted.blob, {
+        contentType:converted.mime,
+        cacheControl:'3600',
+        upsert:false
+      });
+      if(uploadResult.error){
+        console.error('[接力绘] Supabase Storage 上传失败', {path:path, size:converted.blob.size, mime:converted.mime, error:uploadResult.error});
+        throw new Error('图片上传失败：' + (uploadResult.error.message || uploadResult.error.error || 'Storage 请求失败'));
+      }
+      var publicResult = supabase.storage.from('works').getPublicUrl(path);
+      return { image_path:uploadResult.data && uploadResult.data.path ? uploadResult.data.path : path,
+        url:publicResult && publicResult.data ? publicResult.data.publicUrl : '', uploaded:true };
+    }catch(error){
+      console.error('[接力绘] 图片上传流程异常', error);
+      throw error instanceof Error ? error : new Error(String(error && (error.message || error) || '未知上传错误'));
+    }
   }
   async function removeStorageImage(path){
     var storagePath = storagePathFromValue(path);
@@ -789,7 +806,7 @@ function footBar(){
     + '<a href="#" data-act="nav" data-view="home">本期接龙</a>'
     + '<a href="#" data-act="nav" data-view="gallery">往期作品馆</a>'
     + '<a href="#" data-act="login">管理员登录</a></div>'
-    + '<div><h4>STATUS</h4><p>' + (Persist.ok ? '当前为前端原型，所有接龙与报名数据保存在云端数据库中。' : '当前为前端原型，所有接龙与报名数据保存在云端数据库中。') + '</p><p style="margin-top:8px;opacity:.6">数据由 Supabase 驱动。</p></div>'
+    + '<div><h4>STATUS</h4><p>' + (Persist.ok ? '当前为前端原型，所有接龙与报名数据保存在本机浏览器中，清除浏览器数据会重置。' : '当前为前端原型，运行在预览沙箱中，数据保存在本次会话内存里，刷新后回到示例数据。') + '</p><p style="margin-top:8px;opacity:.6">云端接口已预留，接入方式见 source 注释。</p></div>'
     + '</div>'
     + '<div class="foot-bot"><span>© 2026 接力绘 · RELAY DRAWING</span><span>FRONT-END PROTOTYPE</span></div>'
     + '</div></footer>';
@@ -1428,25 +1445,34 @@ function moveModal(evId, from){
 }
 
 function readImg(file){
-  return new Promise(function(res, rej){
-    var fr = new FileReader();
-    fr.onload = function(){
-      var img = new Image();
-      img.onload = function(){
-        var max = 1000, w = img.width, h = img.height;
-        if(Math.max(w, h) > max){ var r = max / Math.max(w, h); w = Math.round(w * r); h = Math.round(h * r); }
-        var c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        var ctx = c.getContext('2d');
+  return new Promise(function(resolve, reject){
+    if(!file) return reject(new Error('没有选择图片'));
+    if(!/^image\//i.test(file.type || '')) return reject(new Error('请选择 JPG、PNG 或 WebP 图片'));
+    if(file.size > 20 * 1024 * 1024) return reject(new Error('原图超过 20MB，请先缩小图片'));
+    var objectUrl = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function(){
+      try{
+        var max = 1400, w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+        if(!w || !h) throw new Error('无法读取图片尺寸');
+        if(Math.max(w, h) > max){ var ratio = max / Math.max(w, h); w = Math.max(1, Math.round(w * ratio)); h = Math.max(1, Math.round(h * ratio)); }
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext('2d');
+        if(!ctx) throw new Error('当前浏览器无法创建图片画布');
         ctx.fillStyle = '#F3EEE4'; ctx.fillRect(0, 0, w, h);
         ctx.drawImage(img, 0, 0, w, h);
-        res(c.toDataURL('image/jpeg', 0.78));
-      };
-      img.onerror = rej;
-      img.src = fr.result;
+        if(!canvas.toBlob) throw new Error('当前浏览器不支持图片压缩，请更新浏览器');
+        canvas.toBlob(function(blob){
+          URL.revokeObjectURL(objectUrl);
+          if(!blob || !blob.size) return reject(new Error('图片压缩失败，画布没有生成有效文件'));
+          resolve(blob);
+        }, 'image/jpeg', 0.78);
+      }catch(error){ URL.revokeObjectURL(objectUrl); reject(error); }
     };
-    fr.onerror = rej;
-    fr.readAsDataURL(file);
+    img.onerror = function(){ URL.revokeObjectURL(objectUrl); reject(new Error('图片解码失败，请换一张图片'));
+    };
+    img.src = objectUrl;
   });
 }
 
@@ -1613,7 +1639,7 @@ document.addEventListener('click', function(e){
         return Promise.resolve(API.updateWork(evw, widx, { img: src }));
       }).then(function(){ return refresh(); })
         .then(function(){ render(); toast('图片换好了'); })
-        .catch(function(){ toast('换图失败，换一张试试'); });
+        .catch(function(err){ console.error('[接力绘] 换图失败', err); toast(err.message || '换图失败，请稍后重试'); });
     });
     picker.click();
     return;
@@ -1731,7 +1757,7 @@ document.addEventListener('submit', function(e){
       return API.addWork(evId2, { title:title, author:author, slot:slot2, img:src, at:new Date().toISOString().slice(5,10) });
     }).then(function(){ return refresh(); })
       .then(function(){ render(); toast('作品已加入'); })
-      .catch(function(){ clearAllBusy(); toast('图片处理失败，换一张试试'); });
+      .catch(function(err){ clearAllBusy(); console.error('[接力绘] 作品上传失败', err); toast(err.message || '图片处理或上传失败，请稍后重试'); });
     return;
   }
 });
